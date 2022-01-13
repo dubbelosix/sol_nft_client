@@ -1,0 +1,20 @@
+[package]
+name = "nft_client"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+solana-client = "1.9.4"
+solana-sdk = "1.9.4"
+bs58 = "0.4.0"
+base64 = "0.13.0"
+solana-account-decoder = "1.9.4"
+solana-program = "1.9.4"
+metaplex-token-metadata = "0.0.1"
+rayon = "1.5.1"
+ureq = { version = "2.4.0", features = ["json"] }
+clap = { version = "3.0.7", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] } 
+serde_json = {version = "1.0"}
