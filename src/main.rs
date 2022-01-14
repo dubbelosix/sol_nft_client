@@ -32,12 +32,28 @@ use {
         Deserialize
     },
     serde_json::{Value,json},
+    backoff::{
+        retry,
+        Error,
+        ExponentialBackoff,
+    },
     core::time::Duration,
     clap::{Parser},
     bs58,
     ureq,
+    itertools::izip,
+    
+    std::{
+        fs::File,
+        io::{self, BufRead, LineWriter, Write},
+        path::Path,
+    },
 
-    rayon::prelude::*,
+    rayon::{
+        prelude::*,
+        iter::{ParallelIterator, IntoParallelRefIterator},
+    },
+    indicatif::{ProgressBar, ParallelProgressIterator},
 };
 
 const RPC_ENDPOINT: &str = "https://ssc-dao.genesysgo.net/";
@@ -115,37 +131,68 @@ struct GetTokenLargestAccountsResponse {
     result: GetTokenLargestAccountsResponse_Result,
 }
 
-fn get_token_account_for_mint(mint_addr_str: String)-> Option<String> {
+fn get_token_account_for_mint(mint_addr_str: String)-> String {
     let request_body = GetTokenLargestAccounts {
         jsonrpc: "2.0".into(),
         id:1,
         method:"getTokenLargestAccounts".into(),
         params: vec![mint_addr_str]
     };
-    let resp = ureq::post(RPC_ENDPOINT).send_json(request_body).unwrap();
-    let token_response: GetTokenLargestAccountsResponse = resp.into_json().unwrap(); 
-    for holder in token_response.result.value {
-        if holder.uiAmount == 1.0 {
-            return Some(holder.address.into())
+
+    let token_account_call = || {
+        let raw_resp = ureq::post(RPC_ENDPOINT).send_json(&request_body);
+        if let Ok(resp) = raw_resp {
+            if let Ok(token_response) = resp.into_json::<GetTokenLargestAccountsResponse>() {
+                for holder in token_response.result.value {
+                    if holder.uiAmount == 1.0 {
+                        return Ok(holder.address.into());
+                    }
+                }
+            }
         }
+        return Err(backoff::Error::Transient{err:"error",retry_after:None});
+    };
+
+    let backoff = ExponentialBackoff::default();
+    match retry(backoff, token_account_call) {
+        Ok(a) => a,
+        _ => "FAILED".into()
     }
-    None
 }
 
 fn get_owner_of_assoc_token(client: &RpcClient, token_account: String) -> String {
-    let token_account_data: UiTokenAccount = client.get_token_account_with_commitment(&Pubkey::new(&bs58::decode(token_account).into_vec().unwrap())
-                                   ,CommitmentConfig{commitment:CommitmentLevel::Finalized}).unwrap().value.unwrap();
-    token_account_data.owner
+    let token_account_owner_call = || {
+        let rpc_result = client.get_token_account_with_commitment(&Pubkey::new(&bs58::decode(&token_account).into_vec().unwrap())
+                                                                  ,CommitmentConfig{commitment:CommitmentLevel::Finalized});
+
+        if let Ok(response) = rpc_result {
+            if let Some(ui_token_acc) = response.value{
+                return Ok(ui_token_acc.owner); 
+            } else {
+                return Err(backoff::Error::Transient{err:"error",retry_after:None});
+            }
+        } else {
+            return Err(backoff::Error::Transient{err:"error",retry_after:None});
+        }
+    };
+
+    let backoff = ExponentialBackoff::default();
+    match retry(backoff, token_account_owner_call) {
+        Ok(a) => a,
+        _ => "FAILED".into()
+    }
 }
 
 fn get_list_of_mints_in_collection(client: &RpcClient, creator0_address: String) -> Vec<String> {
     let metadata_program_pubkey: Pubkey = Pubkey::new(&bs58::decode(METADATA_PROGRAM).into_vec().unwrap());
+    
     let result_vec = client.get_program_accounts_with_config(&metadata_program_pubkey,
                                                              get_address_filter_for_program(
                                                                  creator0_address,
                                                                  METADATA_CREATOR_ADDRESS_0_OFFSET
                                                                  )
                                                              ).unwrap();
+    
     let mut mints: Vec<String> = Vec::new();
     for (metadata_pda, account) in result_vec {
         let metadata = get_struct_from_account_data(&account.data);
@@ -154,23 +201,55 @@ fn get_list_of_mints_in_collection(client: &RpcClient, creator0_address: String)
     mints
 }
 
+fn write_mint_info_to_file(mintrows: Vec<(String,String,String)>) -> std::io::Result<()> {
+    let path = Path::new("newmintfile");
+    let file = File::create(&path)?;
+    let mut file = LineWriter::new(file);
+    file.write_all(b"Owner,Mint,Associated Token Account\n")?;
 
-fn main() {
+    for (owner,mint_addr,associated_token_addr) in mintrows {
+        file.write_all(format!("{},{},{}\n",owner,mint_addr,associated_token_addr).as_bytes())?;
+    }
+    file.flush()?;
+
+    Ok(())
+}
+
+fn retry_test_fn()-> Result<String,String> {
+    let mut x = 1;
+    let op = || {
+        if x == 10 {
+            println!("success");
+            return Ok("rohan");
+        } else {
+            println!("error");
+            x+=1;
+            return Err(backoff::Error::Transient{err:"error",retry_after:None}); 
+            //return Err("what");
+        }
+    };
+    let backoff = ExponentialBackoff::default();
+    retry(backoff, op);
+
+    Ok("rohan".into())
+}
+
+fn main() -> std::io::Result<()> {
+
 
     let client = RpcClient::new_with_timeout(String::from(RPC_ENDPOINT),
                                         Duration::from_secs(RPC_TIMEOUT));
 
+    println!("Getting mints");
     let mint_list = get_list_of_mints_in_collection(&client, "DVemJ8n9ZiSmSf8a18VYgpBgTUoHEA8x6ZZBsTL2bxk9".into());
+    println!("Getting associated token account list");
+    let pb = ProgressBar::new(mint_list.len() as u64);
+    let token_account_list : Vec<String> = mint_list.par_iter().progress_with(pb).map(|x| get_token_account_for_mint(x.into())).collect();
+    println!("Getting associated token account owners");
+    let pb = ProgressBar::new(mint_list.len() as u64);
+    let token_account_owner_list: Vec<String> = token_account_list.par_iter().progress_with(pb).map(|x| get_owner_of_assoc_token(&client,x.into())).collect();
+    let row_vec: Vec<(String,String,String)> = izip!(token_account_owner_list,mint_list,token_account_list).map(|(x,y,z)| (x,y,z)).collect(); 
+    write_mint_info_to_file(row_vec);
 
-    for i in mint_list {
-        println!("{}",i);
-    }
-    println!("=======");
-
-    let token_account = get_token_account_for_mint(String::from("5xRe9LuuHQUh1EUhMfizWRu7cC972UReife9SzSiy4QV")).unwrap();
-    println!("{}",token_account);
-
-    let token_account_owner = get_owner_of_assoc_token(&client, token_account);
-    println!("{}", token_account_owner);
-    
+    Ok(())
 }
