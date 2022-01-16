@@ -250,7 +250,8 @@ struct FileState {
     failed: Vec<String>,
 }
 
-fn get_incomplete_mints(fname: String)-> FileState {
+fn get_incomplete_mints(creator_address: &String)-> FileState {
+    let fname = format!("{}.csv",creator_address);
     let mut fs = FileState {succeeded:Vec::<(String,String,String)>::new(), failed:Vec::<String>::new()};
     let path = Path::new(&fname);
     let file = File::open(path).expect(&format!("error opening file {}",path.display()));
@@ -258,6 +259,9 @@ fn get_incomplete_mints(fname: String)-> FileState {
     for line in lines {
         if let Ok(line_content) = line {
             let lc: Vec<&str> = line_content.split(",").collect();
+            if lc[0] == "Mint" {
+                continue;
+            }
             if lc[1] == FAILED_MARKER || lc[2] == FAILED_MARKER {
                 fs.failed.push(lc[0].into());
             } else {
@@ -325,23 +329,22 @@ fn main() -> std::io::Result<()> {
     let rpc_endpoint = matches.value_of("rpc").unwrap();
     println!("{},{},{},{}",&creator_address,rpc_endpoint,process_failed,threads);
 
-
-    let fs = get_incomplete_mints("newmintfile.csv".into());
-    for i in fs.failed {
-        println!("{}",i);
-    }
-
     rayon::ThreadPoolBuilder::new().num_threads(threads).build_global().unwrap();
-
-
-
     let client = RpcClient::new_with_timeout(String::from(rpc_endpoint),
                                         Duration::from_secs(RPC_TIMEOUT));
+    
+    let mut fs = FileState {succeeded:Vec::<(String,String,String)>::new(), failed:Vec::<String>::new()};
+    let mint_list = if process_failed {
+        fs = get_incomplete_mints(&creator_address);
+        println!("Processing failed mints - {}",fs.failed.len());
+        fs.failed
+    } else {
+        println!("Getting mints");
+        get_list_of_mints_in_collection(&client, &creator_address)
+    };
 
-    println!("Getting mints");
-    let mint_list = get_list_of_mints_in_collection(&client, &creator_address);
     if mint_list.len() == 0 {
-        println!("No mints for creator address: {}", creator_address);
+        println!("No mints for creator address: {}", &creator_address);
         return Ok(());
     }
     println!("Getting associated token account list");
@@ -353,7 +356,12 @@ fn main() -> std::io::Result<()> {
     let token_account_owner_list: Vec<String> = token_account_list.par_iter().progress_with(pb).map(|x| get_owner_of_assoc_token(&client, x.into())).collect();
 
     println!("Formatting final results...");
-    let row_vec: Vec<(String,String,String)> = izip!(mint_list,token_account_owner_list,token_account_list).map(|(x,y,z)| (x,y,z)).collect(); 
+    let mut row_vec: Vec<(String,String,String)> = izip!(mint_list,token_account_owner_list,token_account_list).map(|(x,y,z)| (x,y,z)).collect(); 
+    if process_failed {
+        for i in fs.succeeded {
+            row_vec.push(i);
+        }
+    }
     let fname = write_mint_info_to_file(creator_address.into(),row_vec).unwrap();
     println!("results in file: {}",fname);
 
